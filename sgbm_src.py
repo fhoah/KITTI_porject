@@ -1,3 +1,24 @@
+#環境初始化：檢查並安裝必要函式庫
+import subprocess
+import sys
+
+
+def install_packages():
+    required = {"opencv-python", "numpy", "pandas", "matplotlib", "seaborn", "ultralytics"}
+    # 這裡檢查已安裝的套件 (排除 opencv-python 的變體名稱)
+    installed = {pkg.split('==')[0].lower() for pkg in
+                 subprocess.check_output([sys.executable, '-m', 'pip', 'freeze']).decode().split()}
+
+    for pkg in required:
+        pkg_name = "cv2" if pkg == "opencv-python" else pkg
+        try:
+            __import__(pkg_name if pkg_name != "opencv-python" else "cv2")
+        except ImportError:
+            print(f"正在安裝 {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+
+install_packages()
 #載入函式庫與基本路徑定義
 import os
 import cv2
