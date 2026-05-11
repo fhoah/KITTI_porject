@@ -1,0 +1,12 @@
+.idea/
+__pycache__/
+*.npy
+*.png
+*.jpg
+*.jpeg
+*.zip
+*.rar
+raw_data/
+processed_npy_stereo/
+KITTI_Dataset/
+.ipynb_checkpoints/
