@@ -1,5 +1,8 @@
 import sys
-sys.path.append("core")
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.append(str(SCRIPT_DIR / "core"))
 
 import os
 import glob
@@ -26,16 +29,61 @@ torch.backends.cudnn.benchmark = True
 # 路徑
 # =========================================
 
-LEFT_DIR = r"C:\Users\user\Desktop\KITTI_porject\Train_Data_1000\images_left"
-RIGHT_DIR = r"C:\Users\user\Desktop\KITTI_porject\Train_Data_1000\images_right"
-GT_DIR = r"C:\Users\user\Desktop\KITTI_porject\Train_Data_1000\depth_labels"
+DATASET_VAL_DIR = (SCRIPT_DIR / ".." / "KITTI_dataset" / "val").resolve()
+LEFT_DIR = DATASET_VAL_DIR / "left"
+RIGHT_DIR = DATASET_VAL_DIR / "right"
+GT_DIR = DATASET_VAL_DIR / "disp"
 
 OUTPUT_DIR = r"C:\Users\user\Desktop\KITTI_porject\RAFT_output"
+VISUALIZATION_DIR = SCRIPT_DIR / "results_visualization"
 
 os.makedirs(
     OUTPUT_DIR,
     exist_ok=True
 )
+
+VISUALIZATION_DIR.mkdir(exist_ok=True, parents=True)
+
+
+# =========================================
+# Match validation samples by basename
+# =========================================
+
+left_by_name = {
+    path.stem: path
+    for path in LEFT_DIR.glob("*.png")
+    if path.is_file()
+}
+right_by_name = {
+    path.stem: path
+    for path in RIGHT_DIR.glob("*.png")
+    if path.is_file()
+}
+disp_by_name = {
+    path.stem: path
+    for path in GT_DIR.glob("*.npy")
+    if path.is_file()
+}
+
+matched_names = sorted(
+    set(left_by_name) & set(right_by_name) & set(disp_by_name)
+)
+matched_samples = [
+    (left_by_name[name], right_by_name[name], disp_by_name[name])
+    for name in matched_names
+]
+
+print(f"Resolved left path: {LEFT_DIR}")
+print(f"Resolved right path: {RIGHT_DIR}")
+print(f"Resolved disparity path: {GT_DIR}")
+print(f"Matched sample count: {len(matched_samples)}")
+
+if not matched_samples:
+    print(
+        "ERROR: No validation samples have matching left PNG, right PNG, "
+        "and disparity NPY basenames. Exiting without creating CSV files."
+    )
+    raise SystemExit(0)
 
 
 # =========================================
@@ -70,7 +118,7 @@ model = torch.nn.DataParallel(
 )
 model.load_state_dict(
     torch.load(
-        r"C:\Users\user\Desktop\KITTI_porject\RAFT-Stereo\checkpoints\mykitti_fixed.pth"
+        r"C:\Users\user\Desktop\KITTI_porject\RAFT-Stereo\checkpoints\10000_cnn_swin_h4_10k_5epoch.pth"
     )
 )
 
@@ -85,31 +133,12 @@ print("Model Loaded")
 # 找圖
 # =========================================
 
-left_images = sorted(
-    glob.glob(
-        os.path.join(
-            LEFT_DIR,
-            "*.png"
-        )
-    )
-)
+MAX_IMAGES = 10
 
-gt_files = sorted(
-    glob.glob(
-        os.path.join(
-            GT_DIR,
-            "*.npy"
-        )
-    )
-)
-
-MAX_IMAGES = 5
-
-left_images = left_images[:MAX_IMAGES]
-gt_files = gt_files[:MAX_IMAGES]
+matched_samples = matched_samples[:MAX_IMAGES]
 
 print(
-    f"Total Images: {len(left_images)}"
+    f"Total Images: {len(matched_samples)}"
 )
 
 
@@ -124,36 +153,29 @@ pixel_results = []
 mae_list = []
 
 
+print(
+    "Sign convention: RAFT-Stereo predicts negative horizontal flow for "
+    "positive left-view disparity, so disparity = -flow_up; abs(flow_up) "
+    "is not used because it would make wrong-sign flow appear valid."
+)
+
+
 # =========================================
 # 開始
 # =========================================
 
 pbar = tqdm(
-    enumerate(left_images),
-    total=len(left_images),
+    enumerate(matched_samples),
+    total=len(matched_samples),
     desc="RAFT Processing",
     unit="img"
 )
 
-for idx, left_path in pbar:
+for idx, (left_path, right_path, gt_path) in pbar:
 
     start = time.time()
 
-    filename = os.path.basename(
-        left_path
-    )
-
-    right_path = os.path.join(
-        RIGHT_DIR,
-        filename
-    )
-
-    if not os.path.exists(
-        right_path
-    ):
-        continue
-
-    gt_path = gt_files[idx]
+    filename = left_path.name
 
     # =====================================
     # 讀圖
@@ -213,42 +235,64 @@ for idx, left_path in pbar:
         )
     import matplotlib.pyplot as plt
 
-    disp = flow_up.squeeze().cpu().numpy()
+    raw_flow = flow_up.squeeze().cpu().numpy()
+    finite_raw_flow = raw_flow[np.isfinite(raw_flow)]
+    if finite_raw_flow.size:
+        print(
+            "Raw horizontal flow stats "
+            f"(before sign conversion): min={finite_raw_flow.min():.6f}, "
+            f"max={finite_raw_flow.max():.6f}, "
+            f"mean={finite_raw_flow.mean():.6f}"
+        )
+    else:
+        print("Raw horizontal flow stats: no finite values")
+
+    # StereoDataset trains RAFT-Stereo with horizontal flow = -disparity.
+    # Negation preserves that convention; abs() would turn invalid positive
+    # horizontal flow into apparently valid positive disparity.
+    disparity = -raw_flow
+    disparity = disparity[:h, :w]
+    valid_disparity = np.isfinite(disparity) & (disparity > 0.0)
+
+    finite_positive_disparity = disparity[valid_disparity]
+    if finite_positive_disparity.size:
+        print(
+            "Predicted disparity stats "
+            f"(after disparity=-flow_up): min={finite_positive_disparity.min():.6f}, "
+            f"max={finite_positive_disparity.max():.6f}, "
+            f"mean={finite_positive_disparity.mean():.6f}"
+        )
+    else:
+        print("Predicted disparity stats: no finite positive values")
+
+    disparity[~valid_disparity] = 0.0
 
     plt.figure(figsize=(12,4))
-    plt.imshow(-disp, cmap='jet')
+    plt.imshow(disparity, cmap='jet')
     plt.colorbar()
     plt.title("Predicted Disparity")
     plt.savefig("disp_test.png", bbox_inches='tight')
     plt.close()
-    print("disp min =", disp.min())
-    print("disp max =", disp.max())
-    print("disp mean =", disp.mean())
     print("已儲存 disp_test.png")
-    disparity = flow_up.squeeze().cpu().numpy()
-
-    disparity = disparity[:h, :w]
 
     # =====================================
     # Depth
     # =====================================
 
-    focal = 721.53
-    baseline = 0.54
+    focal = 721.5377
+    baseline = 0.53715
 
     depth = np.zeros_like(
         disparity
     )
 
-    mask = disparity < 0
-
-    depth[mask] = (
+    depth[valid_disparity] = (
 
         focal * baseline
 
-    ) / np.abs(
+    ) / (
 
-        disparity[mask]
+        disparity[valid_disparity]
 
     )
 
@@ -262,9 +306,15 @@ for idx, left_path in pbar:
     # GT
     # =====================================
 
-    gt_depth = np.load(
+    gt_disparity = np.load(
         gt_path
-    )[:h, :w]
+    ).astype(np.float32)[:h, :w]
+
+    valid_gt_disparity = np.isfinite(gt_disparity) & (gt_disparity > 0.0)
+    gt_depth = np.zeros_like(gt_disparity, dtype=np.float32)
+    gt_depth[valid_gt_disparity] = (
+        focal * baseline
+    ) / gt_disparity[valid_gt_disparity]
 
     eval_mask = (
 
@@ -342,6 +392,55 @@ for idx, left_path in pbar:
 
     })
 
+    # =====================================
+    # Five-panel visualization
+    # =====================================
+
+    # This map is visualization-only. The MAE and pixel statistics above keep
+    # using the original, unclipped abs_error values on the unchanged eval_mask.
+    error_map = np.zeros_like(abs_error, dtype=np.float32)
+    error_map[eval_mask] = np.abs(depth[eval_mask] - gt_depth[eval_mask])
+    masked_error_map = np.ma.masked_where(~eval_mask, error_map)
+    error_cmap = plt.get_cmap("inferno").copy()
+    error_cmap.set_bad(color="black")
+
+    fig, axes = plt.subplots(1, 5, figsize=(24, 6))
+
+    axes[0].imshow(imgL)
+    axes[0].set_title("Left Image")
+
+    disparity_plot = axes[1].imshow(disparity, cmap="jet")
+    axes[1].set_title("RAFT Disparity")
+    fig.colorbar(disparity_plot, ax=axes[1], label="Disparity (px)")
+
+    predicted_depth_plot = axes[2].imshow(depth, cmap="viridis", vmin=0, vmax=80)
+    axes[2].set_title("Predicted Depth")
+    fig.colorbar(predicted_depth_plot, ax=axes[2], label="Depth (m)")
+
+    gt_depth_plot = axes[3].imshow(gt_depth, cmap="viridis", vmin=0, vmax=80)
+    axes[3].set_title("Ground Truth Depth")
+    fig.colorbar(gt_depth_plot, ax=axes[3], label="Depth (m)")
+
+    error_plot = axes[4].imshow(
+        masked_error_map,
+        cmap=error_cmap,
+        vmin=0,
+        vmax=2,
+    )
+    axes[4].set_title("Absolute Depth Error")
+    fig.colorbar(error_plot, ax=axes[4], label="Error (m)")
+
+    for axis in axes:
+        axis.axis("off")
+
+    fig.suptitle(
+        f"{filename}\n"
+        f"MAE={mae:.3f} m | FPS={fps:.2f} | Time={process_time:.3f} s"
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(VISUALIZATION_DIR / filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
     pbar.set_postfix(
 
         MAE=f"{mae:.3f}",
@@ -357,6 +456,16 @@ for idx, left_path in pbar:
 results_df = pd.DataFrame(
     results
 )
+
+required_result_columns = {"Image", "MAE", "Time(sec)", "FPS"}
+missing_result_columns = required_result_columns.difference(results_df.columns)
+if results_df.empty or missing_result_columns:
+    print(
+        "ERROR: Inference produced no complete result rows; "
+        f"missing result columns: {sorted(missing_result_columns)}. "
+        "Exiting without creating CSV files or computing a summary."
+    )
+    raise SystemExit(0)
 
 results_csv = os.path.join(
 

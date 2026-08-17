@@ -96,6 +96,7 @@ class Logger:
         metrics_str = ("{:10.4f}, "*len(metrics_data)).format(*metrics_data)
         
         # print the training status
+        print(flush=True)
         logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
 
         if self.writer is None:
@@ -135,6 +136,20 @@ def train(args):
     print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
+    selected_samples = len(train_loader.dataset)
+    batches_per_epoch = len(train_loader)
+    if batches_per_epoch == 0:
+        raise ValueError(
+            "Training dataloader has no full batches; reduce --batch_size or select more samples."
+        )
+
+    equivalent_epochs = args.num_steps / batches_per_epoch
+    print(f"Selected samples: {selected_samples}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Batches per epoch: {batches_per_epoch}")
+    print(f"Requested num_steps: {args.num_steps}")
+    print(f"Equivalent epochs: {equivalent_epochs:.6g}")
+
     optimizer, scheduler = fetch_optimizer(args, model)
     total_steps = 0
     logger = Logger(model, scheduler)
@@ -151,6 +166,9 @@ def train(args):
     model.module.freeze_bn() # We keep BatchNorm frozen
 
     validation_frequency = 10000
+    training_mykitti = any(
+        dataset_name.lower() == 'mykitti' for dataset_name in args.train_datasets
+    )
 
     scaler = GradScaler(enabled=args.mixed_precision)
 
@@ -166,40 +184,74 @@ def train(args):
             flow_predictions = model(image1, image2, iters=args.train_iters)
             assert model.training
 
+            if any(not torch.isfinite(prediction).all() for prediction in flow_predictions):
+                print(
+                    f"WARNING: Non-finite model prediction at training step {total_steps}; "
+                    "loss=not computed, gradient_norm=not computed. Skipping batch."
+                )
+                optimizer.zero_grad()
+                continue
+
             loss, metrics = sequence_loss(flow_predictions, flow, valid)
+            if not torch.isfinite(loss):
+                print(
+                    f"WARNING: Non-finite loss at training step {total_steps}; "
+                    f"loss={loss.detach().item()}, gradient_norm=not computed. "
+                    "Skipping batch."
+                )
+                optimizer.zero_grad()
+                continue
+
             logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=args.clip
+            )
+
+            if not torch.isfinite(torch.as_tensor(gradient_norm)):
+                print(
+                    f"WARNING: Non-finite gradient norm at training step {total_steps}; "
+                    f"loss={loss.detach().item()}, "
+                    f"gradient_norm={torch.as_tensor(gradient_norm).detach().item()}. "
+                    "Skipping optimizer and scheduler steps."
+                )
+                optimizer.zero_grad()
+                scaler.update()
+                continue
 
             scaler.step(optimizer)
-            scheduler.step()
             scaler.update()
+            scheduler.step()
 
             logger.push(metrics)
+            total_steps += 1
 
-            if total_steps % validation_frequency == validation_frequency - 1:
-                save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+            if total_steps % validation_frequency == 0:
+                save_path = Path('checkpoints/%d_%s.pth' % (total_steps, args.name))
+                print(flush=True)
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
-                results = validate_things(model.module, iters=args.valid_iters)
+                if training_mykitti:
+                    logging.info(
+                        "Skipping post-checkpoint validation: MyKITTI validation is not implemented."
+                    )
+                else:
+                    results = validate_things(model.module, iters=args.valid_iters)
+                    logger.write_dict(results)
+                    model.train()
+                    model.module.freeze_bn()
 
-                logger.write_dict(results)
-
-                model.train()
-                model.module.freeze_bn()
-
-            total_steps += 1
-
-            if total_steps > args.num_steps:
+            if total_steps >= args.num_steps:
                 should_keep_training = False
                 break
 
         if len(train_loader) >= 10000:
-            save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
+            save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps, args.name))
+            print(flush=True)
             logging.info(f"Saving file {save_path}")
             torch.save(model.state_dict(), save_path)
 
@@ -225,6 +277,8 @@ if __name__ == '__main__':
     parser.add_argument('--image_size', type=int, nargs='+', default=[320, 720], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=16, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
+    parser.add_argument('--clip', type=float, default=1.0, help="gradient clipping norm.")
+    parser.add_argument('--max_train_samples', type=int, default=None, help="maximum number of MyKITTI training stereo pairs to use (fixed subset seed: 42).")
 
     # Validation parameters
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')

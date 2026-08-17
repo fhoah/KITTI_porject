@@ -262,64 +262,100 @@ class MyKITTI(StereoDataset):
     def __init__(
         self,
         aug_params=None,
-        root=r"C:\Users\user\Desktop\KITTI_porject\Train_Data_1000\dataset",
-        split='train'
+        root=None,
+        split='train',
+        max_train_samples=None
     ):
+
+        if root is None:
+            root = Path(__file__).resolve().parents[2] / "KITTI_dataset"
+        root = Path(root).expanduser().resolve()
 
         super(
             MyKITTI,
             self
         ).__init__(
             aug_params,
-            sparse=False,
-            reader=np.load
+            sparse=True,
+            reader=self._read_disparity
         )
 
-        left_list = sorted(
-            glob(
-                os.path.join(
-                    root,
-                    split,
-                    "left",
-                    "*.png"
+        if split not in {"train", "val"}:
+            raise ValueError(f"MyKITTI split must be 'train' or 'val', got {split!r}")
+
+        train_samples = self._matched_samples(root, "train")
+        val_samples = self._matched_samples(root, "val")
+
+        print(f"Total MyKITTI samples: {len(train_samples)}")
+
+        if split == "train" and max_train_samples is not None:
+            if max_train_samples <= 0:
+                raise ValueError("max_train_samples must be a positive integer")
+            if max_train_samples > len(train_samples):
+                raise ValueError(
+                    f"max_train_samples ({max_train_samples}) exceeds the available "
+                    f"MyKITTI training samples ({len(train_samples)})"
                 )
-            )
-        )
+            train_samples = random.Random(42).sample(train_samples, max_train_samples)
 
-        right_list = sorted(
-            glob(
-                os.path.join(
-                    root,
+        print(f"Selected training samples: {len(train_samples)}")
+        print(f"Validation samples: {len(val_samples)}")
+
+        selected_samples = train_samples if split == "train" else val_samples
+        for img1, img2, disp in selected_samples:
+            self.image_list.append([str(img1), str(img2)])
+            self.disparity_list.append(str(disp))
+
+    @staticmethod
+    def _read_disparity(path):
+        disp = np.load(path, allow_pickle=False).astype(np.float32)
+        valid = np.isfinite(disp) & (disp > 0.0) & (disp < 512.0)
+        disp[~valid] = 0.0
+        return disp, valid.astype(np.float32)
+
+    @staticmethod
+    def _matched_samples(root, split):
+        split_root = root / split
+        left_dir = split_root / "left"
+        right_dir = split_root / "right"
+        disp_dir = split_root / "disp"
+
+        left_by_name = {
+            path.stem: path
+            for path in left_dir.glob("*.png")
+            if path.is_file()
+        }
+        right_by_name = {
+            path.stem: path
+            for path in right_dir.glob("*.png")
+            if path.is_file()
+        }
+        disp_by_name = {
+            path.stem: path
+            for path in disp_dir.glob("*.npy")
+            if path.is_file()
+        }
+
+        samples = []
+        all_names = sorted(set(left_by_name) | set(right_by_name) | set(disp_by_name))
+        for name in all_names:
+            left = left_by_name.get(name)
+            right = right_by_name.get(name)
+            disp = disp_by_name.get(name)
+            if left is None or right is None or disp is None:
+                logging.warning(
+                    "Skipping incomplete MyKITTI %s sample %s "
+                    "(left=%s, right=%s, disp=%s)",
                     split,
-                    "right",
-                    "*.png"
+                    name,
+                    left is not None,
+                    right is not None,
+                    disp is not None,
                 )
-            )
-        )
+                continue
+            samples.append((left, right, disp))
 
-        disp_list = sorted(
-            glob(
-                os.path.join(
-                    root,
-                    split,
-                    "disp",
-                    "*.npy"
-                )
-            )
-        )
-
-        print(
-            f"MyKITTI {split}:",
-            len(left_list)
-        )
-
-        for img1, img2, disp in zip(
-            left_list,
-            right_list,
-            disp_list
-        ):
-            self.image_list += [[img1, img2]]
-            self.disparity_list += [disp]
+        return samples
 
 
 class Middlebury(StereoDataset):
@@ -369,7 +405,8 @@ def fetch_dataloader(args):
 
             new_dataset = MyKITTI(
                 aug_params,
-                split='train'
+                split='train',
+                max_train_samples=getattr(args, "max_train_samples", None)
             )
 
             logging.info(
@@ -403,4 +440,3 @@ def fetch_dataloader(args):
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
-

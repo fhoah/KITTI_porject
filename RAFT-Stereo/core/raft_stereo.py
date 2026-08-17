@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from core.update import BasicMultiUpdateBlock
-from core.extractor import BasicEncoder, MultiBasicEncoder, ResidualBlock
+from core.extractor import MultiBasicEncoder, ResidualBlock
+from core.cnn_swin_encoder import CNNSwinEncoder
 from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D, AlternateCorrBlock
 from core.utils.utils import coords_grid, upflow8
 
@@ -36,8 +37,12 @@ class RAFTStereo(nn.Module):
                 ResidualBlock(128, 128, 'instance', stride=1),
                 nn.Conv2d(128, 256, 3, padding=1))
         else:
-            self.fnet = BasicEncoder(output_dim=256, norm_fn='instance', downsample=args.n_downsample)
-
+            self.fnet = CNNSwinEncoder(
+                output_dim=256,
+                norm_fn='instance',
+                downsample=args.n_downsample
+            )
+            print("Using feature encoder: CNNSwinEncoder")
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -108,6 +113,21 @@ class RAFTStereo(nn.Module):
         for itr in range(iters):
             coords1 = coords1.detach()
             corr = corr_fn(coords1) # index correlation volume
+            if itr == 0 and not self.args.shared_backbone:
+                corr_stats = corr.detach().float()
+                cnn_stats = self.fnet.debug_stats["CNN feature"]
+                swin_stats = self.fnet.debug_stats["Swin feature"]
+                fusion_stats = self.fnet.debug_stats["Fusion feature"]
+                print(
+                    f"\rCNN mean={cnn_stats['mean']:.3f} std={cnn_stats['std']:.3f} | "
+                    f"Swin mean={swin_stats['mean']:.3f} std={swin_stats['std']:.3f} | "
+                    f"Fusion mean={fusion_stats['mean']:.3f} std={fusion_stats['std']:.3f} | "
+                    f"Corr mean={corr_stats.mean().item():.3f} "
+                    f"std={corr_stats.std(unbiased=False).item():.3f} "
+                    f"max={corr_stats.max().item():.3f}",
+                    end="",
+                    flush=True,
+                )
             flow = coords1 - coords0
             with autocast(enabled=self.args.mixed_precision):
                 if self.args.n_gru_layers == 3 and self.args.slow_fast_gru: # Update low-res GRU
