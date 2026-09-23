@@ -115,11 +115,13 @@ class CNNSwinEncoder(nn.Module):
                 f"Unexpected Swin feature rank: {feature.ndim}"
             )
 
-        if feature.shape[1] == self.swin_channels:
-            return feature
-
+        # timm Swin features_only commonly returns NHWC: [B, H, W, C]
         if feature.shape[-1] == self.swin_channels:
             return feature.permute(0, 3, 1, 2).contiguous()
+
+        # Fallback for NCHW: [B, C, H, W]
+        if feature.shape[1] == self.swin_channels:
+            return feature
 
         raise RuntimeError(
             f"Unexpected Swin feature shape: {tuple(feature.shape)}"
