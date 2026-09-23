@@ -1,0 +1,1 @@
+checkpoints/cnn_swin_h4_finetune_5epoch.pth filter=lfs diff=lfs merge=lfs -text
