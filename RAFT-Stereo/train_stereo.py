@@ -79,6 +79,124 @@ def fetch_optimizer(args, model):
     return optimizer, scheduler
 
 
+def _checkpoint_group(key):
+    """Return a concise component name for checkpoint-loading summaries."""
+    key = key.removeprefix('module.')
+    for group in ('fnet.cnn_branch', 'fnet.swin', 'fnet.fusion'):
+        if key.startswith(f'{group}.'):
+            return group
+    if key.startswith('fnet.'):
+        return 'fnet / old BasicEncoder'
+    if 'context_zqr_convs' in key:
+        return 'context_zqr_convs'
+    return key.split('.', 1)[0]
+
+
+def _sort_checkpoint_groups(groups):
+    preferred_order = (
+        'fnet.cnn_branch',
+        'fnet.swin',
+        'fnet.fusion',
+        'cnet',
+        'context_zqr_convs',
+        'update_block',
+    )
+    order = {group: index for index, group in enumerate(preferred_order)}
+    return sorted(groups, key=lambda group: (order.get(group, len(order)), group))
+
+
+def load_partial_checkpoint(model, checkpoint_path):
+    """Load architecture-compatible weights from a RAFT-Stereo checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint_state = checkpoint['state_dict'] if (
+        isinstance(checkpoint, dict) and 'state_dict' in checkpoint
+    ) else checkpoint
+
+    if not isinstance(checkpoint_state, dict):
+        raise TypeError(
+            "Checkpoint must be a state_dict or a dictionary containing 'state_dict'."
+        )
+
+    normalized_checkpoint_keys = {
+        key.removeprefix('module.') for key in checkpoint_state
+    }
+    cnn_swin_prefixes = (
+        'fnet.cnn_branch.',
+        'fnet.swin.',
+        'fnet.fusion.',
+    )
+    is_cnn_swin_checkpoint = all(
+        any(key.startswith(prefix) for key in normalized_checkpoint_keys)
+        for prefix in cnn_swin_prefixes
+    )
+    checkpoint_encoder = (
+        'CNNSwinEncoder' if is_cnn_swin_checkpoint else 'BasicEncoder'
+    )
+
+    model_state = model.state_dict()
+    model_keys = {key.removeprefix('module.'): key for key in model_state}
+    compatible_state = {}
+    loaded_keys = []
+    skipped_keys = []
+
+    for checkpoint_key, value in checkpoint_state.items():
+        normalized_key = checkpoint_key.removeprefix('module.')
+
+        if (not is_cnn_swin_checkpoint
+                and normalized_key.startswith('fnet.')):
+            skipped_keys.append((checkpoint_key, 'intentionally skipped fnet'))
+            continue
+
+        model_key = model_keys.get(normalized_key)
+        if model_key is None:
+            skipped_keys.append((checkpoint_key, 'key not found'))
+            continue
+
+        if not hasattr(value, 'shape') or value.shape != model_state[model_key].shape:
+            checkpoint_shape = getattr(value, 'shape', None)
+            skipped_keys.append(
+                (checkpoint_key, 'shape mismatch '
+                 f'(checkpoint: {checkpoint_shape}, model: {model_state[model_key].shape})')
+            )
+            continue
+
+        compatible_state[model_key] = value
+        loaded_keys.append(normalized_key)
+
+    # The dictionary is filtered above, so strict=False only leaves newly initialized
+    # or incompatible model parameters untouched.
+    model.load_state_dict(compatible_state, strict=False)
+
+    loaded_groups = _sort_checkpoint_groups(
+        {_checkpoint_group(key) for key in loaded_keys}
+    )
+    skipped_groups = _sort_checkpoint_groups(
+        {_checkpoint_group(key) for key, _ in skipped_keys}
+    )
+
+    print(f'Checkpoint encoder detected: {checkpoint_encoder}')
+    print('Checkpoint loading summary')
+    print(f'Loaded parameters: {len(loaded_keys)}')
+    print(f'Skipped parameters: {len(skipped_keys)}')
+    print('\nLoaded groups:')
+    for group in loaded_groups:
+        print(f'- {group}')
+    if not loaded_groups:
+        print('- none')
+
+    print('\nSkipped groups:')
+    for group in skipped_groups:
+        print(f'- {group}')
+    if not skipped_groups:
+        print('- none')
+
+    print('\nSkipped keys:')
+    for key, reason in skipped_keys:
+        print(f'- {key}: {reason}')
+    if not skipped_keys:
+        print('- none')
+
+
 class Logger:
 
     SUM_FREQ = 100
@@ -157,8 +275,7 @@ def train(args):
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
-        checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        load_partial_checkpoint(model, args.restore_ckpt)
         logging.info(f"Done loading checkpoint")
 
     model.cuda()
